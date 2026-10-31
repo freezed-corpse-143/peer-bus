@@ -15,13 +15,21 @@ peer-bus replaces only the transport: HTTP to a peer URL, which can be a LAN add
 
 ## Install
 
-One file per machine, loaded as an omp extension:
+The extension ships as one bundled file, `dist/peer-bus.js` (~20 KB, Node builtins only). Two equivalent ways to load it:
 
 ```powershell
-omp -e C:\Projects\peer-bus\src\extension.ts
+# 1. link the package (manifest "pi.extensions" points at the bundle)
+omp install C:\Projects\peer-bus
+
+# 2. or point a single session at the file
+omp -e C:\Projects\peer-bus\dist\peer-bus.js
 ```
 
-Nothing is published to npm; `src/extension.ts` is the entry point and importing it is the install.
+Rebuild after changing `src/`:
+
+```powershell
+bun run build     # bun build src/extension.ts --outfile dist/peer-bus.js --target node --format esm
+```
 
 ## Configure
 

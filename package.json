@@ -5,7 +5,13 @@
 	"type": "module",
 	"description": "Cross-machine agent-to-agent handoffs for oh-my-pi, over plain HTTP/TCP (LAN or an SSH loopback tunnel)",
 	"license": "MIT",
+	"main": "./dist/peer-bus.js",
+	"files": ["dist", "src", "README.md", "LICENSE"],
+	"pi": {
+		"extensions": ["./dist/peer-bus.js"]
+	},
 	"scripts": {
+		"build": "bun build src/extension.ts --outfile dist/peer-bus.js --target node --format esm",
 		"test": "bun test",
 		"test:watch": "bun test --watch"
 	},

@@ -2,8 +2,7 @@
 node_modules/
 bun.lockb
 
-# build output
-dist/
+# build output (dist/peer-bus.js is the shipped extension bundle and is tracked)
 out/
 
 # local test artefacts
