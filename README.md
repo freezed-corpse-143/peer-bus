@@ -23,6 +23,9 @@ omp install C:\Projects\peer-bus
 
 # 2. or point a single session at the file
 omp -e C:\Projects\peer-bus\dist\peer-bus.js
+
+# 3. or install straight from GitHub (public repository)
+omp install github:freezed-corpse-143/peer-bus
 ```
 
 Rebuild after changing `src/`:
@@ -137,6 +140,18 @@ The sender's working directory and machine are stamped into the document, so a c
 - Bind loopback plus an SSH tunnel by default. A LAN bind is an explicit choice; scope the firewall rule to `LocalSubnet`.
 - Handoff content becomes prompt input on the receiving agent. Only pair machines you trust; treat a peer URL like a shell access grant.
 - No transport encryption of its own. Use the SSH tunnel (or TLS in front) when the wire is not trusted.
+
+## Docs
+
+Operating notes from the two-machine setup (Chinese):
+
+| File | Content |
+|---|---|
+| [docs/01-passwordless-ssh.md](docs/01-passwordless-ssh.md) | Passwordless SSH between two Windows machines: administrators_authorized_keys, the Public-profile firewall trap, verification |
+| [docs/02-herdr-cross-machine.md](docs/02-herdr-cross-machine.md) | herdr `machine add` + what actually forwards, and how to drive a remote omp session |
+| [docs/03-peer-bus-setup.md](docs/03-peer-bus-setup.md) | Shipping the bundle, the 7461/7462/7463 tunnel map, env on both sides, three-layer self-check |
+| [docs/04-debugging-cross-machine.md](docs/04-debugging-cross-machine.md) | Symptom → cause tables per layer, and the two rules that keep tests honest |
+| [docs/05-protocol.md](docs/05-protocol.md) | The v1 wire contract: endpoints, handshake guarantees, delivery policy, limits |
 
 ## Tests
 
