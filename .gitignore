@@ -1,0 +1,18 @@
+# deps
+node_modules/
+bun.lockb
+
+# build output
+dist/
+out/
+
+# local test artefacts
+*.log
+.tmp/
+tmp/
+coverage/
+
+# editor
+.DS_Store
+.idea/
+.vscode/

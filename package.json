@@ -1,0 +1,21 @@
+{
+	"name": "peer-bus",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Cross-machine agent-to-agent handoffs for oh-my-pi, over plain HTTP/TCP (LAN or an SSH loopback tunnel)",
+	"license": "MIT",
+	"scripts": {
+		"test": "bun test",
+		"test:watch": "bun test --watch"
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@types/bun": "latest"
+	},
+	"engines": {
+		"bun": ">=1.3.0"
+	}
+}
