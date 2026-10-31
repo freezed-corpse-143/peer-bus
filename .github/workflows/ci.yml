@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      # The suite imports only this repo and Bun builtins, so CI runs without
+      # `bun install` on purpose: adding a runtime dependency has to break here
+      # rather than on someone's machine.
+      - name: tests
+        run: bun test
+
+      # dist/peer-bus.js is the shipped artifact and is committed; a source
+      # change that was not rebuilt would otherwise ship stale code.
+      - name: bundle matches source
+        run: |
+          bun run build
+          git diff --exit-code -- dist/peer-bus.js
