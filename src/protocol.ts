@@ -286,3 +286,170 @@ export function senderStamp(cwd: string, session?: string): SenderStamp {
 		...(session ? { session } : {}),
 	};
 }
+
+/* ────────────────────────── lifecycle: list / hello / bye ──────────────────────────
+ *
+ * `peer_send` moves work. These three routes move *relationships*: they discover
+ * who is listening, prove that both directions of the pipe work, and close the
+ * channel when the work is done. They are transport-level (no agent turn is spent
+ * deciding whether to answer a handshake) except for the greeting and the closing
+ * notice, which are injected for the peer agent to read.
+ */
+
+/** A challenge the receiver has issued and not yet seen confirmed. */
+export const HELLO_TTL_MS = 60_000;
+/** Oldest challenge is dropped when this many are outstanding. */
+export const MAX_PENDING_HELLOS = 32;
+/** Deadline for discovery probes and for each handshake leg. */
+export const PROBE_TIMEOUT_MS = 2_000;
+
+/** What a node answers about itself. Identity only — no URLs, they are not portable. */
+export interface NodeInfo {
+	v: typeof PROTOCOL_VERSION;
+	name: string;
+	/** What is hosting the listener: an omp session. */
+	host: "omp";
+	machine: string;
+	project: string;
+	cwd: string;
+	session?: string;
+	/** Peer names this node has configured, so a caller can tell if it will be answered. */
+	peers: string[];
+	capabilities: string[];
+	startedAt: string;
+}
+
+export interface HelloRequest {
+	v: typeof PROTOCOL_VERSION;
+	from: string;
+	nonce: string;
+	/** The caller's own identity, so the greeting can name who knocked. */
+	info?: NodeInfo;
+}
+
+export interface HelloReply {
+	ok: true;
+	/** Echo of the caller's nonce: proof the receiver saw the request. */
+	nonce: string;
+	/** A fresh challenge the caller must return to finish the handshake. */
+	challenge: string;
+	/** Correlates the greeting with the caller's ack. */
+	id: string;
+	ttlMs: number;
+	info: NodeInfo;
+}
+
+export interface HelloConfirm {
+	v: typeof PROTOCOL_VERSION;
+	from: string;
+	challenge: string;
+}
+
+export interface HelloConfirmAck {
+	ok: true;
+	verified: true;
+	id: string;
+}
+
+export interface ByeRequest {
+	v: typeof PROTOCOL_VERSION;
+	from: string;
+	summary?: string;
+}
+
+/** 32 hex characters, no dashes — fits in a header, log line, or card. */
+export function newNonce(): string {
+	return randomUUID().replace(/-/g, "");
+}
+
+export interface DescribeHelloInput {
+	handshakeId: string;
+	fromName: string;
+	fromInfo: NodeInfo;
+	/** Measured by the caller only; the greeting omits it when unknown. */
+	rttMs?: number;
+	/** True when the receiver's `peers` already contains the caller's name. */
+	replyConfigured: boolean;
+	/** The caller's listener as it sees itself; loopback means "same tunnel only". */
+	listenHint: string;
+}
+
+/** The greeting the receiving agent reads after a handshake completes. */
+export function describeHello(input: DescribeHelloInput): string {
+	const { fromInfo } = input;
+	const loopback = /^(127\.0\.0\.1|localhost|::1):/.test(input.listenHint);
+	const reply = input.replyConfigured
+		? `**How to reply** (one reverse handoff, closes the greeting):\n` +
+			`peer_send({ peer: "${input.fromName}", kind: "notification", replyTo: "${input.handshakeId}", ` +
+			`summary: "ack: ${input.fromName} handshake verified", requirements: "no action" })\n\n` +
+			"A bare acknowledgement is the whole reply. Do not do work for them here."
+		: `**You cannot answer directly**: \`${input.fromName}\` is not in your peer list.\n` +
+			`Ask the user to add \`${input.fromName}=${input.listenHint}\` to PEER_BUS_PEERS ` +
+			"(env or config) and restart the session; then reply with one `peer_send` of kind `notification` " +
+			`carrying replyTo "${input.handshakeId}".` +
+			(loopback
+				? "\n\nThe hint is a loopback address, so it is only reachable through the same tunnel they used."
+				: "");
+	return (
+		`🤝 [Handshake from **${input.fromName}**] (handshake \`${input.handshakeId}\`` +
+		`${input.rttMs === undefined ? "" : `, ${input.rttMs} ms`})\n\n` +
+		`**Both directions are proven**: their request reached you, your challenge came back to them, ` +
+		`and this confirmation reached you again. Their node will accept your next handoff.\n\n` +
+		`Their node: \`${fromInfo.name}\` · ${fromInfo.host} · machine \`${fromInfo.machine}\` · ` +
+		`project \`${fromInfo.project}\` · cwd \`${fromInfo.cwd}\`\n\n${reply}`
+	);
+}
+
+export interface DescribeByeInput {
+	fromName: string;
+	summary?: string;
+	handshakeId?: string;
+}
+
+/** The closing notice the receiving agent reads. Context only; it never wakes the agent. */
+export function describeBye(input: DescribeByeInput): string {
+	const said = input.summary?.trim() ? `\n\nThey said: ${input.summary.trim()}` : "";
+	const id = input.handshakeId ? ` (handshake \`${input.handshakeId}\`)` : "";
+	return (
+		`🔌 [Channel closed by **${input.fromName}**]${id}\n\n` +
+		`They expect no further handoffs in this exchange. Do not reply to this notice, ` +
+		`and do not send a closing acknowledgement — a bye is already the close.${said}`
+	);
+}
+
+/** Validate a life-cycle body: `{ from, ... }` with the protocol version when present. */
+export function parseLifecycle(raw: unknown, fields: string[]): Record<string, unknown> | string {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return "body must be an object";
+	const body = raw as Record<string, unknown>;
+	if (body.v !== undefined && body.v !== PROTOCOL_VERSION) return `unsupported protocol version: ${String(body.v)}`;
+	for (const field of fields) {
+		const value = body[field];
+		if (typeof value !== "string" || value.trim() === "" || value.length > 4096) return `${field} is required`;
+	}
+	return body;
+}
+
+/** Narrow an untrusted `/info` (or `hello.info`) body. Undefined when the shape is wrong. */
+export function asNodeInfo(value: unknown): NodeInfo | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const body = value as Record<string, unknown>;
+	if (typeof body.name !== "string" || typeof body.machine !== "string" || typeof body.project !== "string") {
+		return undefined;
+	}
+	const peers = Array.isArray(body.peers) ? body.peers.filter((p): p is string => typeof p === "string") : [];
+	const capabilities = Array.isArray(body.capabilities)
+		? body.capabilities.filter((c): c is string => typeof c === "string")
+		: [];
+	return {
+		v: PROTOCOL_VERSION,
+		name: body.name,
+		host: "omp",
+		machine: body.machine,
+		project: body.project,
+		cwd: typeof body.cwd === "string" ? body.cwd : "",
+		...(typeof body.session === "string" && body.session ? { session: body.session } : {}),
+		peers,
+		capabilities,
+		startedAt: typeof body.startedAt === "string" ? body.startedAt : "",
+	};
+}

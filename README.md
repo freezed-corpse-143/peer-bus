@@ -80,6 +80,41 @@ peer_send({ peer: "laptopB", kind: "task",
 
 `peer_status()` reports the node name, listener, peers, ledger size and the last send outcome.
 
+## Communication lifecycle
+
+`peer_send` moves work. Three more tools move the *relationship*, so two agents never have to guess whether the other side is reachable, what it is, or how it wants to be answered.
+
+| Step | Tool | What it does |
+|---|---|---|
+| 1. discover | `peer_list({ urls? })` | `GET /info` on every configured peer (plus any ad-hoc URLs). Reports name, machine, project, session, whether that peer knows you, and the channel state. Unreachable peers come back with the reason — never assumed. |
+| 2. greet | `peer_hello({ peer \| url })` | Three-way nonce handshake over `/hello` + `/hello/confirm`, then a greeting is injected into the peer's agent loop telling it exactly how to answer. |
+| 3. work | `peer_send(...)` | Handoffs as before; the channel state is unchanged. |
+| 4. close | `peer_bye({ peer, summary? })` | `/bye`: the peer's agent is told to stop and not to reply; the channel is marked closed here. |
+
+### What the handshake actually proves
+
+```
+A → B  POST /hello   {from: A, nonce, info}        A proved it can send
+B → A  200           {nonce echoed, challenge}      B proved it received, and A proved it can receive
+A → B  POST /hello/confirm {challenge}              B proved it received our answer
+```
+
+`verified` requires all three: our nonce echoed back (B's receive path), a challenge issued (B's send path), and our returned challenge accepted (A's receive path). A peer that answers with the wrong nonce, no challenge, or an expired/replayed challenge is reported as unverified — the sender never claims a channel it does not have.
+
+`/hello` also carries the caller's identity, so the greeting on the far side can name who knocked and where their files are. The greeting tells the peer's agent either the exact reverse call:
+
+```
+peer_send({ peer: "alpha", kind: "notification", replyTo: "<handshake id>", ... })
+```
+
+or, when the peer has no entry for you, that it cannot answer and what to add (`alpha=<your listener>`), with a warning when that address is loopback and only reachable through the same tunnel.
+
+Challenges are single-use, sender-bound, and expire after 60 s; at most 32 are outstanding.
+
+### Discovery is seeded, not broadcast
+
+There is no scan, mDNS, or rendezvous service. A node knows the peers in `PEER_BUS_PEERS` / the config file, and `/info` reports each node's own peer *names* (not URLs — they are not portable). So `peer_list` answers "which of the sessions I know about are alive, and what are they", and `peer_list({ urls: [...] })` lets you check an address someone told you about before committing it to config. Adding a machine is one line on each side, deliberately.
+
 ### Envelope and delivery semantics
 
 | Concept | Behaviour |
@@ -109,14 +144,14 @@ The sender's working directory and machine are stamped into the document, so a c
 bun test
 ```
 
-Covers the document/envelope contract, kind parsing, hop clamping, delivery policy, the idempotency ledger (including restart and pruning), every server branch (401/400/409/413/duplicate/tampered body/method), and every sender outcome, including the timeout-means-`unknown` rule.
+55 tests covering the document/envelope contract, kind parsing, hop clamping, delivery policy, the idempotency ledger (including restart and pruning), every server branch (401/400/409/413/duplicate/tampered body/method), every sender outcome including timeout-means-`unknown`, and the lifecycle: identity probing, the three-way handshake (echo, challenge, replay, wrong sender, liar peer), greeting text for both the configured and unconfigured case, and bye delivery.
 
 ## Layout
 
 ```
-src/protocol.ts   envelope, document, validation, delivery policy, inbound prompt
-src/server.ts     POST /inject — auth, size cap, target check, dedupe, integrity
-src/client.ts     one POST per handoff, classified into an honest outcome
+src/protocol.ts   envelope, document, lifecycle wire types, cards, delivery policy
+src/server.ts     /info · /hello · /hello/confirm · /inject · /bye
+src/client.ts     probe, handshake, send, bye — each classified into an honest result
 src/store.ts      on-disk idempotency ledger (atomic, pruned)
 src/extension.ts  omp wiring: peer_send / peer_status, listener lifecycle
 test/             contract tests

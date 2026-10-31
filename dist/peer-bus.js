@@ -172,6 +172,74 @@ function senderStamp(cwd, session) {
     ...session ? { session } : {}
   };
 }
+var HELLO_TTL_MS = 60000;
+var MAX_PENDING_HELLOS = 32;
+var PROBE_TIMEOUT_MS = 2000;
+function newNonce() {
+  return randomUUID().replace(/-/g, "");
+}
+function describeHello(input) {
+  const { fromInfo } = input;
+  const loopback = /^(127\.0\.0\.1|localhost|::1):/.test(input.listenHint);
+  const reply = input.replyConfigured ? `**How to reply** (one reverse handoff, closes the greeting):
+` + `peer_send({ peer: "${input.fromName}", kind: "notification", replyTo: "${input.handshakeId}", ` + `summary: "ack: ${input.fromName} handshake verified", requirements: "no action" })
+
+` + "A bare acknowledgement is the whole reply. Do not do work for them here." : `**You cannot answer directly**: \`${input.fromName}\` is not in your peer list.
+` + `Ask the user to add \`${input.fromName}=${input.listenHint}\` to PEER_BUS_PEERS ` + "(env or config) and restart the session; then reply with one `peer_send` of kind `notification` " + `carrying replyTo "${input.handshakeId}".` + (loopback ? `
+
+The hint is a loopback address, so it is only reachable through the same tunnel they used.` : "");
+  return `\uD83E\uDD1D [Handshake from **${input.fromName}**] (handshake \`${input.handshakeId}\`` + `${input.rttMs === undefined ? "" : `, ${input.rttMs} ms`})
+
+` + `**Both directions are proven**: their request reached you, your challenge came back to them, ` + `and this confirmation reached you again. Their node will accept your next handoff.
+
+` + `Their node: \`${fromInfo.name}\` · ${fromInfo.host} · machine \`${fromInfo.machine}\` · ` + `project \`${fromInfo.project}\` · cwd \`${fromInfo.cwd}\`
+
+${reply}`;
+}
+function describeBye(input) {
+  const said = input.summary?.trim() ? `
+
+They said: ${input.summary.trim()}` : "";
+  const id = input.handshakeId ? ` (handshake \`${input.handshakeId}\`)` : "";
+  return `\uD83D\uDD0C [Channel closed by **${input.fromName}**]${id}
+
+` + `They expect no further handoffs in this exchange. Do not reply to this notice, ` + `and do not send a closing acknowledgement — a bye is already the close.${said}`;
+}
+function parseLifecycle(raw, fields) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw))
+    return "body must be an object";
+  const body = raw;
+  if (body.v !== undefined && body.v !== PROTOCOL_VERSION)
+    return `unsupported protocol version: ${String(body.v)}`;
+  for (const field of fields) {
+    const value = body[field];
+    if (typeof value !== "string" || value.trim() === "" || value.length > 4096)
+      return `${field} is required`;
+  }
+  return body;
+}
+function asNodeInfo(value) {
+  if (typeof value !== "object" || value === null)
+    return;
+  const body = value;
+  if (typeof body.name !== "string" || typeof body.machine !== "string" || typeof body.project !== "string") {
+    return;
+  }
+  const peers = Array.isArray(body.peers) ? body.peers.filter((p) => typeof p === "string") : [];
+  const capabilities = Array.isArray(body.capabilities) ? body.capabilities.filter((c) => typeof c === "string") : [];
+  return {
+    v: PROTOCOL_VERSION,
+    name: body.name,
+    host: "omp",
+    machine: body.machine,
+    project: body.project,
+    cwd: typeof body.cwd === "string" ? body.cwd : "",
+    ...typeof body.session === "string" && body.session ? { session: body.session } : {},
+    peers,
+    capabilities,
+    startedAt: typeof body.startedAt === "string" ? body.startedAt : ""
+  };
+}
 
 // src/client.ts
 async function sendHandoff(options) {
@@ -219,6 +287,91 @@ async function sendHandoff(options) {
     return { outcome: "not-delivered", status: response.status, ack, error: ack.error ?? "peer refused" };
   return { outcome: "delivered", status: response.status, ack };
 }
+async function exchange(url, init, timeoutMs) {
+  try {
+    const response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    const text = await response.text();
+    let value;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      value = undefined;
+    }
+    if (!response.ok) {
+      const detail = typeof value === "object" && value !== null && "error" in value && typeof value.error === "string" ? value.error : text.slice(0, 200) || `HTTP ${response.status}`;
+      return { status: response.status, error: detail };
+    }
+    return { status: response.status, value };
+  } catch (error) {
+    const name = error instanceof Error ? error.name : "";
+    const timedOut = name === "TimeoutError" || name === "AbortError";
+    return { error: timedOut ? `no answer within ${timeoutMs} ms` : String(error) };
+  }
+}
+async function fetchInfo(options) {
+  const timeout = options.timeoutMs ?? PROBE_TIMEOUT_MS;
+  const started = performance.now();
+  const result = await exchange(`${options.baseUrl.replace(/\/+$/, "")}/info`, { method: "GET", headers: options.token ? { authorization: `Bearer ${options.token}` } : {} }, timeout);
+  const rttMs = Math.round(performance.now() - started);
+  if (result.error)
+    return { reachable: false, status: result.status, rttMs, error: result.error };
+  const info = asNodeInfo(result.value);
+  if (!info)
+    return { reachable: false, status: result.status, rttMs, error: "/info did not return a node identity" };
+  return { reachable: true, info, status: result.status, rttMs };
+}
+async function handshake(options) {
+  const base = options.baseUrl.replace(/\/+$/, "");
+  const timeout = options.timeoutMs ?? PROBE_TIMEOUT_MS;
+  const headers = {
+    "content-type": "application/json",
+    ...options.token ? { authorization: `Bearer ${options.token}` } : {}
+  };
+  const started = performance.now();
+  const nonce = newNonce();
+  const hello = await exchange(`${base}/hello`, { method: "POST", headers, body: JSON.stringify({ v: PROTOCOL_VERSION, from: options.from, nonce, info: options.info }) }, timeout);
+  if (hello.error)
+    return { verified: false, error: hello.error };
+  const reply = hello.value;
+  if (typeof reply !== "object" || reply === null)
+    return { verified: false, error: "/hello returned no body" };
+  const fields = reply;
+  if (fields.nonce !== nonce) {
+    return { verified: false, error: "peer did not echo the nonce — its receive path is unproven" };
+  }
+  if (typeof fields.challenge !== "string" || fields.challenge === "") {
+    return { verified: false, error: "peer issued no challenge — its send path is unproven" };
+  }
+  const info = asNodeInfo(fields.info);
+  const confirm = await exchange(`${base}/hello/confirm`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ v: PROTOCOL_VERSION, from: options.from, challenge: fields.challenge })
+  }, timeout);
+  if (confirm.error)
+    return { verified: false, info, error: confirm.error };
+  const rttMs = Math.round(performance.now() - started);
+  return {
+    verified: true,
+    id: typeof fields.id === "string" ? fields.id : undefined,
+    info,
+    rttMs,
+    replyConfigured: info ? info.peers.includes(options.from) : false
+  };
+}
+async function sendBye(options) {
+  const result = await exchange(`${options.baseUrl.replace(/\/+$/, "")}/bye`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...options.token ? { authorization: `Bearer ${options.token}` } : {}
+    },
+    body: JSON.stringify({ v: PROTOCOL_VERSION, from: options.from, summary: options.summary })
+  }, options.timeoutMs ?? SEND_TIMEOUT_MS);
+  if (result.error)
+    return { delivered: false, status: result.status, error: result.error };
+  return { delivered: true, status: result.status };
+}
 
 // src/server.ts
 function json(status, body) {
@@ -228,24 +381,35 @@ function failure(status, id, error) {
   const body = { ok: false, id, error };
   return json(status, body);
 }
+async function readJson(request) {
+  const declared = Number(request.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > MAX_REQUEST_BYTES) {
+    return { ok: false, response: json(413, { ok: false, error: "request body exceeds the size cap" }) };
+  }
+  const raw = await request.text();
+  if (Buffer.byteLength(raw, "utf-8") > MAX_REQUEST_BYTES) {
+    return { ok: false, response: json(413, { ok: false, error: "request body exceeds the size cap" }) };
+  }
+  try {
+    return { ok: true, value: JSON.parse(raw) };
+  } catch {
+    return { ok: false, response: json(400, { ok: false, error: "body is not valid JSON" }) };
+  }
+}
 function startServer(options) {
   const { name, log } = options;
+  const pending = new Map;
+  const sweepPending = () => {
+    const now = Date.now();
+    for (const [challenge, entry] of pending)
+      if (entry.expiresAt <= now)
+        pending.delete(challenge);
+  };
   async function handleInject(request) {
-    const declared = Number(request.headers.get("content-length") ?? "");
-    if (Number.isFinite(declared) && declared > MAX_REQUEST_BYTES) {
-      return failure(413, "", "request body exceeds the size cap");
-    }
-    const raw = await request.text();
-    if (Buffer.byteLength(raw, "utf-8") > MAX_REQUEST_BYTES) {
-      return failure(413, "", "request body exceeds the size cap");
-    }
-    let payload;
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      return failure(400, "", "body is not valid JSON");
-    }
-    const parsed = parseEnvelope(payload);
+    const read = await readJson(request);
+    if (!read.ok)
+      return read.response;
+    const parsed = parseEnvelope(read.value);
     if (!parsed.ok)
       return failure(400, "", parsed.error);
     const envelope = parsed.envelope;
@@ -268,6 +432,86 @@ function startServer(options) {
       return failure(500, envelope.id, error instanceof Error ? error.message : String(error));
     }
   }
+  async function handleHello(request) {
+    const read = await readJson(request);
+    if (!read.ok)
+      return read.response;
+    const body = parseLifecycle(read.value, ["from", "nonce"]);
+    if (typeof body === "string")
+      return json(400, { ok: false, error: body });
+    sweepPending();
+    if (pending.size >= MAX_PENDING_HELLOS) {
+      const oldest = pending.keys().next().value;
+      if (oldest !== undefined)
+        pending.delete(oldest);
+    }
+    const challenge = newNonce();
+    const id = newNonce();
+    pending.set(challenge, {
+      from: body.from,
+      id,
+      info: asNodeInfo(body.info),
+      expiresAt: Date.now() + HELLO_TTL_MS
+    });
+    const reply = {
+      ok: true,
+      nonce: body.nonce,
+      challenge,
+      id,
+      ttlMs: HELLO_TTL_MS,
+      info: options.info()
+    };
+    log?.("handshake challenge issued", { from: body.from, id });
+    return json(200, reply);
+  }
+  async function handleConfirm(request) {
+    const read = await readJson(request);
+    if (!read.ok)
+      return read.response;
+    const body = parseLifecycle(read.value, ["from", "challenge"]);
+    if (typeof body === "string")
+      return json(400, { ok: false, error: body });
+    sweepPending();
+    const entry = pending.get(body.challenge);
+    if (!entry || entry.from !== body.from) {
+      return json(409, {
+        ok: false,
+        error: "no matching challenge — expired, already used, or a different sender"
+      });
+    }
+    pending.delete(body.challenge);
+    try {
+      options.onHello?.({ from: entry.from, id: entry.id, info: entry.info });
+    } catch (error) {
+      log?.("handshake greeting failed", { from: entry.from, error: String(error) });
+    }
+    const ack = { ok: true, verified: true, id: entry.id };
+    log?.("handshake verified", { from: entry.from, id: entry.id });
+    return json(200, ack);
+  }
+  async function handleBye(request) {
+    const read = await readJson(request);
+    if (!read.ok)
+      return read.response;
+    const body = parseLifecycle(read.value, ["from"]);
+    if (typeof body === "string")
+      return json(400, { ok: false, error: body });
+    const summary = typeof body.summary === "string" ? body.summary.slice(0, 2000) : undefined;
+    try {
+      options.onBye?.({ from: body.from, summary });
+    } catch (error) {
+      log?.("bye notice failed", { from: body.from, error: String(error) });
+    }
+    log?.("channel closed by peer", { from: body.from });
+    return json(200, { ok: true });
+  }
+  const routes = {
+    "/info": { method: "GET", handle: () => json(200, options.info()) },
+    "/inject": { method: "POST", handle: handleInject },
+    "/hello": { method: "POST", handle: handleHello },
+    "/hello/confirm": { method: "POST", handle: handleConfirm },
+    "/bye": { method: "POST", handle: handleBye }
+  };
   const server = Bun.serve({
     hostname: options.host,
     port: options.port,
@@ -278,21 +522,22 @@ function startServer(options) {
           return new Response("method not allowed", { status: 405 });
         return json(200, { ok: true, name, v: PROTOCOL_VERSION });
       }
-      if (url.pathname !== "/inject")
+      const route = routes[url.pathname];
+      if (!route)
         return new Response("not found", { status: 404 });
-      if (request.method !== "POST")
+      if (request.method !== route.method)
         return new Response("method not allowed", { status: 405 });
       if (options.token) {
         const header = request.headers.get("authorization") ?? "";
         if (header !== `Bearer ${options.token}`)
           return new Response("unauthorized", { status: 401 });
       }
-      return handleInject(request);
+      return route.handle(request);
     }
   });
   log?.("listening", { name, host: options.host, port: server.port });
   return {
-    port: server.port,
+    port: server.port ?? options.port,
     stop: () => server.stop(true)
   };
 }
@@ -422,12 +667,30 @@ function peerBus(pi) {
   let server;
   let context;
   let lastOutcome;
+  const startedAt = new Date().toISOString();
+  const channels = new Map;
   const stampFor = (ctx) => senderStamp(ctx?.cwd ?? config.cwd, ctx?.sessionManager?.getSessionId?.());
   const isRuntimeIdle = (ctx) => {
     if (!ctx)
       return true;
     return ctx.isIdle() && !ctx.hasPendingMessages();
   };
+  const nodeInfo = () => {
+    const session = context?.sessionManager?.getSessionId?.();
+    return {
+      v: PROTOCOL_VERSION,
+      name: config.name,
+      host: "omp",
+      machine: os2.hostname(),
+      project: path2.basename(config.cwd) || config.cwd,
+      cwd: config.cwd,
+      ...session ? { session } : {},
+      peers: Object.keys(config.peers),
+      capabilities: ["handoff", "hello", "bye"],
+      startedAt
+    };
+  };
+  const listenHint = () => `${config.host}:${server?.port ?? config.port}`;
   const stopServer = () => {
     server?.stop();
     server = undefined;
@@ -440,6 +703,7 @@ function peerBus(pi) {
         host: config.host,
         port: config.port,
         token: config.token,
+        info: nodeInfo,
         isDuplicate: (id) => ledger.has(id),
         onHandoff: (envelope) => {
           const docPath = path2.join(os2.tmpdir(), `peer-bus-${envelope.id}.md`);
@@ -460,6 +724,49 @@ function peerBus(pi) {
           pi.sendMessage({ customType: "peer-bus-inbound", content, display: true }, choice);
           log("handoff injected", { id: envelope.id, from: envelope.from, deliverAs: choice.deliverAs });
           return { ok: true, id: envelope.id, deliveredAs: choice.deliverAs };
+        },
+        onHello: ({ from, id, info }) => {
+          const choice = deliveryFor(isRuntimeIdle(context), 0);
+          const intro = info ?? {
+            v: PROTOCOL_VERSION,
+            name: from,
+            host: "omp",
+            machine: "unknown",
+            project: "unknown",
+            cwd: "unknown",
+            peers: [],
+            capabilities: [],
+            startedAt: ""
+          };
+          const content = describeHello({
+            handshakeId: id,
+            fromName: from,
+            fromInfo: intro,
+            replyConfigured: nodeInfo().peers.includes(from),
+            listenHint: listenHint()
+          });
+          channels.set(from, {
+            state: "verified",
+            handshakeId: id,
+            rttMs: 0,
+            replyConfigured: nodeInfo().peers.includes(from),
+            verifiedAt: new Date().toISOString()
+          });
+          pi.sendMessage({ customType: "peer-bus-hello", content, display: true }, choice);
+          log("greeting injected", { from, id, deliverAs: choice.deliverAs });
+        },
+        onBye: ({ from, summary }) => {
+          const channel = channels.get(from);
+          if (channel)
+            channel.state = "closed";
+          channels.set(from, {
+            ...channel ?? { handshakeId: "", rttMs: 0, replyConfigured: false, verifiedAt: "" },
+            state: "closed",
+            closedAt: new Date().toISOString()
+          });
+          const content = describeBye({ fromName: from, summary, handshakeId: channel?.handshakeId });
+          pi.sendMessage({ customType: "peer-bus-bye", content, display: true }, { deliverAs: "nextTurn" });
+          log("bye injected", { from });
         },
         log
       });
@@ -525,19 +832,155 @@ function peerBus(pi) {
   pi.registerTool({
     name: "peer_status",
     label: "Peer bus status",
-    description: "Report this peer-bus node's name, listener, configured peers, and the last send outcome.",
+    description: "Report this peer-bus node's name, listener, configured peers, channels verified by handshake, and the last send outcome.",
     parameters: z.object({}),
     async execute() {
+      const channelLines = channels.size === 0 ? ["channels: none verified this session"] : ["channels:", ...[...channels.entries()].map(([peer, channel]) => `  ${peer}: ${channel.state} (handshake ${channel.handshakeId || "—"}, ${channel.rttMs} ms, they know us: ${channel.replyConfigured ? "yes" : "no"}` + `${channel.closedAt ? `, closed ${channel.closedAt}` : ""})`)];
       const lines = [
         `name: ${config.name}`,
         `listener: ${server ? `${config.host}:${server.port}` : "not listening"}`,
         `peers: ${Object.entries(config.peers).map(([name, url]) => `${name}=${url}`).join(", ") || "none"}`,
         `ledger: ${ledger.size} ids`,
-        `protocol: v${PROTOCOL_VERSION}`,
-        `last send: ${lastOutcome ? `${lastOutcome.outcome} → ${lastOutcome.peer} (${lastOutcome.id})` : "none this session"}`
+        `protocol: v${PROTOCOL_VERSION} (info · hello · bye · inject)`,
+        `last send: ${lastOutcome ? `${lastOutcome.outcome} → ${lastOutcome.peer} (${lastOutcome.id})` : "none this session"}`,
+        ...channelLines
       ];
       return { content: [{ type: "text", text: lines.join(`
-`) }], details: { name: config.name } };
+`) }], details: { name: config.name, channels: channels.size } };
+    }
+  });
+  pi.registerTool({
+    name: "peer_list",
+    label: "Discover peers",
+    description: "Probe every configured peer (plus any URLs you pass) and report which omp sessions answer: name, machine, project, session, whether they know you, and the channel state. Unreachable peers are reported with the reason, never assumed.",
+    parameters: z.object({
+      urls: z.array(z.string()).optional().describe("Extra base URLs to probe ad hoc, e.g. http://192.168.1.10:7462")
+    }),
+    async execute(_toolCallId, params) {
+      const extra = params.urls ?? [];
+      const targets = [
+        ...Object.entries(config.peers).map(([name, url]) => ({ name, url })),
+        ...extra.map((url, index) => ({ name: `probe${index + 1}`, url }))
+      ];
+      if (targets.length === 0) {
+        return {
+          content: [{ type: "text", text: "no peers configured — set PEER_BUS_PEERS or peers in the config file" }],
+          details: { probes: 0 }
+        };
+      }
+      const results = await Promise.all(targets.map(async (target) => ({
+        ...target,
+        probe: await fetchInfo({ baseUrl: target.url, token: config.token, timeoutMs: PROBE_TIMEOUT_MS })
+      })));
+      const rows = results.map(({ name, url, probe }) => {
+        const info = probe.info;
+        const channel = channels.get(name) ?? (info ? channels.get(info.name) : undefined);
+        return [
+          name,
+          url,
+          probe.reachable ? `reachable ${probe.rttMs ?? 0}ms` : "unreachable",
+          info?.machine ?? "—",
+          info?.project ?? "—",
+          info?.session ?? "—",
+          channel?.state ?? "never",
+          info ? info.peers.includes(config.name) ? "yes" : "no" : "—"
+        ].join(" | ");
+      });
+      const errors = results.filter((r) => !r.probe.reachable).map((r) => `${r.name}: ${r.probe.error}`);
+      const text = [
+        "name | url | status | machine | project | session | channel | knows me",
+        ...rows,
+        ...errors.length > 0 ? ["", "errors:", ...errors] : []
+      ].join(`
+`);
+      return {
+        content: [{ type: "text", text }],
+        details: { peers: results.map(({ name, probe }) => ({ name, reachable: probe.reachable, error: probe.error })) }
+      };
+    }
+  });
+  pi.registerTool({
+    name: "peer_hello",
+    label: "Handshake with a peer",
+    description: "Open a channel with another omp session: a three-way nonce handshake proves you can send to it and receive from it, returns its identity, and tells its agent exactly how to answer you. Do this before handing it work.",
+    parameters: z.object({
+      peer: z.string().optional().describe(`Configured peer name (${Object.keys(config.peers).join(", ") || "none configured"})`),
+      url: z.string().optional().describe("Base URL for a peer that is not configured yet"),
+      note: z.string().optional().describe("Optional one-line note kept for your own log")
+    }),
+    async execute(_toolCallId, params) {
+      const input = params;
+      const key = input.peer ?? input.url;
+      const baseUrl = input.peer ? config.peers[input.peer] : input.url;
+      if (!key || !baseUrl) {
+        throw new Error(`Unknown peer "${input.peer ?? ""}". Pass a configured peer name or a url.`);
+      }
+      const result = await handshake({
+        baseUrl,
+        token: config.token,
+        from: config.name,
+        info: nodeInfo(),
+        timeoutMs: PROBE_TIMEOUT_MS
+      });
+      if (!result.verified) {
+        return {
+          content: [{ type: "text", text: `handshake with ${key} failed: ${result.error ?? "unknown reason"}` }],
+          details: { peer: key, verified: false, ...result }
+        };
+      }
+      const info = result.info;
+      channels.set(key, {
+        state: "verified",
+        handshakeId: result.id ?? "",
+        rttMs: result.rttMs ?? 0,
+        replyConfigured: result.replyConfigured ?? false,
+        verifiedAt: new Date().toISOString()
+      });
+      const lines = [
+        `handshake with ${key}: verified in ${result.rttMs ?? 0} ms (id ${result.id ?? "—"})`,
+        info ? `peer: ${info.name} · ${info.host} · ${info.machine} · ${info.project}${info.session ? ` · session ${info.session}` : ""}` : "peer: (no identity in the reply)",
+        result.replyConfigured ? `they know us: yes — they can answer as "${config.name}"` : `they know us: no — add ${config.name}=${listenHint()} to their PEER_BUS_PEERS; the greeting already told them this`,
+        "greeting: delivered to their agent (asked for one notification back as the ack)",
+        ...input.note ? [`note: ${input.note}`] : []
+      ];
+      return { content: [{ type: "text", text: lines.join(`
+`) }], details: { peer: key, verified: true, ...result } };
+    }
+  });
+  pi.registerTool({
+    name: "peer_bye",
+    label: "Close a peer channel",
+    description: "Close the channel with a peer: it stops the exchange, tells their agent not to reply, and marks the channel closed here. Use it when the work is done, before idling.",
+    parameters: z.object({
+      peer: z.string().optional().describe("Configured peer name"),
+      url: z.string().optional().describe("Base URL when the peer is not configured"),
+      summary: z.string().optional().describe("One line for the peer: what concluded")
+    }),
+    async execute(_toolCallId, params) {
+      const input = params;
+      const key = input.peer ?? input.url;
+      const baseUrl = input.peer ? config.peers[input.peer] : input.url;
+      if (!key || !baseUrl)
+        throw new Error(`Unknown peer "${input.peer ?? ""}". Pass a configured peer name or a url.`);
+      const result = await sendBye({ baseUrl, token: config.token, from: config.name, summary: input.summary });
+      if (!result.delivered) {
+        return {
+          content: [{ type: "text", text: `bye not delivered to ${key}: ${result.error ?? "no detail"}` }],
+          details: { peer: key, delivered: false, ...result }
+        };
+      }
+      const channel = channels.get(key);
+      if (channel)
+        channel.state = "closed";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `bye delivered to ${key}; channel closed. Their agent was told not to reply, and no acknowledgement is expected back.`
+          }
+        ],
+        details: { peer: key, delivered: true, status: result.status }
+      };
     }
   });
 }

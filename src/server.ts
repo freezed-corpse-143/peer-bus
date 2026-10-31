@@ -1,17 +1,31 @@
 /**
  * Inbound HTTP endpoint.
  *
- * One route that matters: `POST /inject` takes a handoff envelope, validates it,
- * de-duplicates it, and hands it to the extension, which injects it into the
- * agent loop. The server itself never touches the agent.
+ * Four routes carry the protocol:
+ *   GET  /info           identity of this node (what am I talking to?)
+ *   POST /hello          handshake leg 1: echo the caller's nonce, issue a challenge
+ *   POST /hello/confirm  handshake leg 2: challenge returned → both directions proven
+ *   POST /inject         a handoff envelope, validated, de-duplicated, injected
+ *   POST /bye            closing notice; the channel is done
+ *
+ * The server never runs the agent itself. `onHandoff` / `onHello` / `onBye` hand
+ * the payload to the extension, which decides how (or whether) the agent wakes.
  */
 import {
 	type AckBody,
 	type HandoffEnvelope,
+	HELLO_TTL_MS,
+	type HelloConfirmAck,
+	type HelloReply,
 	type Integrity,
+	MAX_PENDING_HELLOS,
 	MAX_REQUEST_BYTES,
+	type NodeInfo,
 	PROTOCOL_VERSION,
+	asNodeInfo,
+	newNonce,
 	parseEnvelope,
+	parseLifecycle,
 	sha256Hex,
 } from "./protocol";
 
@@ -27,10 +41,16 @@ export interface StartServerOptions {
 	port: number;
 	/** Bearer token. Empty disables the check (loopback development only). */
 	token?: string;
+	/** Current identity, read fresh for every `/info` and `/hello`. */
+	info: () => NodeInfo;
 	/** True when this id was already accepted; the server answers without injecting. */
 	isDuplicate: (id: string) => boolean;
 	/** Deliver into the agent loop and return the acknowledgement. */
 	onHandoff: (envelope: HandoffEnvelope, context: InboundContext) => AckBody | Promise<AckBody>;
+	/** Handshake completed: the caller proved it can send *and* receive. */
+	onHello?: (params: { from: string; id: string; info?: NodeInfo }) => void;
+	/** Closing notice. Must not wake the agent. */
+	onBye?: (params: { from: string; summary?: string }) => void;
 	log?: (message: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -48,25 +68,46 @@ function failure(status: number, id: string, error: string): Response {
 	return json(status, body);
 }
 
+type JsonRead = { ok: true; value: unknown } | { ok: false; response: Response };
+
+async function readJson(request: Request): Promise<JsonRead> {
+	const declared = Number(request.headers.get("content-length") ?? "");
+	if (Number.isFinite(declared) && declared > MAX_REQUEST_BYTES) {
+		return { ok: false, response: json(413, { ok: false, error: "request body exceeds the size cap" }) };
+	}
+	const raw = await request.text();
+	if (Buffer.byteLength(raw, "utf-8") > MAX_REQUEST_BYTES) {
+		return { ok: false, response: json(413, { ok: false, error: "request body exceeds the size cap" }) };
+	}
+	try {
+		return { ok: true, value: JSON.parse(raw) };
+	} catch {
+		return { ok: false, response: json(400, { ok: false, error: "body is not valid JSON" }) };
+	}
+}
+
+interface PendingHello {
+	from: string;
+	id: string;
+	/** The caller's self-description, when it sent one. */
+	info?: NodeInfo;
+	expiresAt: number;
+}
+
 export function startServer(options: StartServerOptions): ServerHandle {
 	const { name, log } = options;
+	/** Outstanding challenges, keyed by the challenge string. Single use, TTL-bounded. */
+	const pending = new Map<string, PendingHello>();
+
+	const sweepPending = () => {
+		const now = Date.now();
+		for (const [challenge, entry] of pending) if (entry.expiresAt <= now) pending.delete(challenge);
+	};
 
 	async function handleInject(request: Request): Promise<Response> {
-		const declared = Number(request.headers.get("content-length") ?? "");
-		if (Number.isFinite(declared) && declared > MAX_REQUEST_BYTES) {
-			return failure(413, "", "request body exceeds the size cap");
-		}
-		const raw = await request.text();
-		if (Buffer.byteLength(raw, "utf-8") > MAX_REQUEST_BYTES) {
-			return failure(413, "", "request body exceeds the size cap");
-		}
-		let payload: unknown;
-		try {
-			payload = JSON.parse(raw);
-		} catch {
-			return failure(400, "", "body is not valid JSON");
-		}
-		const parsed = parseEnvelope(payload);
+		const read = await readJson(request);
+		if (!read.ok) return read.response;
+		const parsed = parseEnvelope(read.value);
 		if (!parsed.ok) return failure(400, "", parsed.error);
 		const envelope = parsed.envelope;
 		if (envelope.to !== name) {
@@ -89,6 +130,84 @@ export function startServer(options: StartServerOptions): ServerHandle {
 		}
 	}
 
+	async function handleHello(request: Request): Promise<Response> {
+		const read = await readJson(request);
+		if (!read.ok) return read.response;
+		const body = parseLifecycle(read.value, ["from", "nonce"]);
+		if (typeof body === "string") return json(400, { ok: false, error: body });
+		sweepPending();
+		if (pending.size >= MAX_PENDING_HELLOS) {
+			const oldest = pending.keys().next().value;
+			if (oldest !== undefined) pending.delete(oldest);
+		}
+		const challenge = newNonce();
+		const id = newNonce();
+		pending.set(challenge, {
+			from: body.from as string,
+			id,
+			info: asNodeInfo(body.info),
+			expiresAt: Date.now() + HELLO_TTL_MS,
+		});
+		const reply: HelloReply = {
+			ok: true,
+			nonce: body.nonce as string,
+			challenge,
+			id,
+			ttlMs: HELLO_TTL_MS,
+			info: options.info(),
+		};
+		log?.("handshake challenge issued", { from: body.from, id });
+		return json(200, reply);
+	}
+
+	async function handleConfirm(request: Request): Promise<Response> {
+		const read = await readJson(request);
+		if (!read.ok) return read.response;
+		const body = parseLifecycle(read.value, ["from", "challenge"]);
+		if (typeof body === "string") return json(400, { ok: false, error: body });
+		sweepPending();
+		const entry = pending.get(body.challenge as string);
+		if (!entry || entry.from !== body.from) {
+			return json(409, {
+				ok: false,
+				error: "no matching challenge — expired, already used, or a different sender",
+			});
+		}
+		pending.delete(body.challenge as string);
+		try {
+			options.onHello?.({ from: entry.from, id: entry.id, info: entry.info });
+		} catch (error) {
+			// The transport proof stands even if the greeting could not be injected.
+			log?.("handshake greeting failed", { from: entry.from, error: String(error) });
+		}
+		const ack: HelloConfirmAck = { ok: true, verified: true, id: entry.id };
+		log?.("handshake verified", { from: entry.from, id: entry.id });
+		return json(200, ack);
+	}
+
+	async function handleBye(request: Request): Promise<Response> {
+		const read = await readJson(request);
+		if (!read.ok) return read.response;
+		const body = parseLifecycle(read.value, ["from"]);
+		if (typeof body === "string") return json(400, { ok: false, error: body });
+		const summary = typeof body.summary === "string" ? body.summary.slice(0, 2_000) : undefined;
+		try {
+			options.onBye?.({ from: body.from as string, summary });
+		} catch (error) {
+			log?.("bye notice failed", { from: body.from, error: String(error) });
+		}
+		log?.("channel closed by peer", { from: body.from });
+		return json(200, { ok: true });
+	}
+
+	const routes: Record<string, { method: string; handle: (request: Request) => Response | Promise<Response> }> = {
+		"/info": { method: "GET", handle: () => json(200, options.info()) },
+		"/inject": { method: "POST", handle: handleInject },
+		"/hello": { method: "POST", handle: handleHello },
+		"/hello/confirm": { method: "POST", handle: handleConfirm },
+		"/bye": { method: "POST", handle: handleBye },
+	};
+
 	const server = Bun.serve({
 		hostname: options.host,
 		port: options.port,
@@ -98,19 +217,20 @@ export function startServer(options: StartServerOptions): ServerHandle {
 				if (request.method !== "GET") return new Response("method not allowed", { status: 405 });
 				return json(200, { ok: true, name, v: PROTOCOL_VERSION });
 			}
-			if (url.pathname !== "/inject") return new Response("not found", { status: 404 });
-			if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+			const route = routes[url.pathname];
+			if (!route) return new Response("not found", { status: 404 });
+			if (request.method !== route.method) return new Response("method not allowed", { status: 405 });
 			if (options.token) {
 				const header = request.headers.get("authorization") ?? "";
 				if (header !== `Bearer ${options.token}`) return new Response("unauthorized", { status: 401 });
 			}
-			return handleInject(request);
+			return route.handle(request);
 		},
 	});
 
 	log?.("listening", { name, host: options.host, port: server.port });
 	return {
-		port: server.port,
+		port: server.port ?? options.port,
 		stop: () => server.stop(true),
 	};
 }
